@@ -64,9 +64,14 @@ _MODELS_CHECKED = False
 current_dir = os.path.dirname(os.path.abspath(__file__))
 qwen_tts_dir = os.path.join(current_dir, "qwen_tts")
 
-# Ensure the parent directory is in sys.path for absolute import
+# CRITICAL: Add current_dir to sys.path FIRST so Python can resolve 'qwen_tts' as a package
+# This allows qwen_tts internal files to use relative imports like 'from ..core.models import ...'
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
+
+# Also ensure the qwen_tts folder itself is importable
+if qwen_tts_dir not in sys.path:
+    sys.path.insert(0, qwen_tts_dir)
 
 try:
     # 1. Try absolute import first (if user installed via pip)
@@ -76,26 +81,20 @@ try:
 except ImportError:
     try:
         # 2. Fallback to local package import (relative or absolute via sys.path)
-        from .qwen_tts import Qwen3TTSModel, VoiceClonePromptItem
-    except (ImportError, ValueError):
-        try:
-            # Last ditch effort for absolute import from local folder via sys.path
-            import qwen_tts
-            Qwen3TTSModel = qwen_tts.Qwen3TTSModel
-            VoiceClonePromptItem = qwen_tts.VoiceClonePromptItem
-        except ImportError as e:
-            import traceback
-            print(f"\n❌ [Qwen3-TTS] Critical Import Error: {e}")
-            if not os.path.exists(qwen_tts_dir):
-                print(f"   Missing directory: {qwen_tts_dir}")
-                print("   Please clone the repository with submodules or ensure 'qwen_tts' folder exists.")
-            else:
-                print("   Traceback for debugging:")
-                traceback.print_exc()
-                print("\n   Common fix: run 'pip install -r requirements.txt' in your ComfyUI environment.")
-            
-            Qwen3TTSModel = None
-            VoiceClonePromptItem = None
+        from qwen_tts import Qwen3TTSModel, VoiceClonePromptItem
+    except ImportError as e:
+        import traceback
+        print(f"\n❌ [Qwen3-TTS] Critical Import Error: {e}")
+        if not os.path.exists(qwen_tts_dir):
+            print(f"   Missing directory: {qwen_tts_dir}")
+            print("   Please clone the repository with submodules or ensure 'qwen_tts' folder exists.")
+        else:
+            print("   Traceback for debugging:")
+            traceback.print_exc()
+            print("\n   Common fix: run 'pip install -r requirements.txt' in your ComfyUI environment.")
+        
+        Qwen3TTSModel = None
+        VoiceClonePromptItem = None
 
 
 # Global model cache

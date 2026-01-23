@@ -8,3 +8,4 @@ numpy
 einops
 tiktoken
 sentencepiece
+sox

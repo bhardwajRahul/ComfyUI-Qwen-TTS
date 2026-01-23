@@ -6,6 +6,13 @@ English | [中文版](README_CN.md)
 
 ComfyUI custom nodes for speech synthesis, voice cloning, and voice design, based on the open-source **Qwen3-TTS** project by the Alibaba Qwen team.
 
+## 📋 Changelog
+
+### 2026-01-23 - Dependency Compatibility Fix
+- **Fixed**: Resolved `transformers` version conflicts with `qwen-tts` dependency
+- **Improvement**: Now supports local package import without requiring `pip install qwen-tts`
+- **Note**: The official `qwen-tts` package requires `transformers==4.57.3`, which may conflict with other ComfyUI nodes. This version uses bundled local code to avoid dependency issues.
+
 ## Key Features
 
 - 🎵 **Speech Synthesis**: High-quality text-to-speech conversion.
