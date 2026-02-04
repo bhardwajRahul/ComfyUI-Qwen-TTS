@@ -17,6 +17,13 @@
 - **2026-01-24**：为所有 TTS 节点添加生成参数 (top_p, top_k, temperature, repetition_penalty) ([update.md](doc/update.md))
 - **2026-01-23**：依赖兼容性与 Mac (MPS) 支持，新增节点：VoiceClonePromptNode, DialogueInferenceNode ([update.md](doc/update.md))
 
+## 在线工作流 (Online Workflows)
+
+- **Qwen3-TTS 多角色多轮对话生成工作流**:
+  - [workflow](https://www.runninghub.cn/post/2014703508829769729/?inviteCode=rh-v104)
+- **Qwen3-TTS 3-in-1 (克隆、设计、自定义) 工作流**:
+  - [workflow](https://www.runninghub.cn/post/2014962110224142337/?inviteCode=rh-v104)
+
 ## 功能特性
 
 - 🎵 **语音合成**: 高质量的文本转语音功能。
@@ -224,3 +231,8 @@ qwen-tts: D:\MyAI\Models\Qwen
 
 - 本项目采用 **Apache License 2.0** 许可证。
 - 模型权重请参考 [Qwen3-TTS 许可协议](https://github.com/QwenLM/Qwen3-TTS#License)。
+
+## 作者 (Author)
+
+- **Bilibili**: [个人空间](https://space.bilibili.com/5594117?spm_id_from=333.1007.0.0)
+- **YouTube**: [频道](https://www.youtube.com/channel/UCx5L-wKf93YNbcP_55vDCeg)
