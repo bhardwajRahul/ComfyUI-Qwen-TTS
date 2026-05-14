@@ -16,6 +16,34 @@ from comfy.utils import ProgressBar
 from comfy import model_management
 from server import PromptServer
 
+# ===== XPU 稳定性补丁：修复 level_zero 设备丢失 =====
+import transformers.pytorch_utils
+import importlib
+import torch
+
+# 替换原始函数为 XPU 安全版本
+_original_isin = transformers.pytorch_utils.isin_mps_friendly
+
+def _safe_isin(elements, test_elements):
+    """将 isin 操作移到 CPU 执行，防止 Intel XPU level_zero 崩溃"""
+    try:
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            if isinstance(elements, torch.Tensor) and elements.device.type == 'xpu':
+                elements_cpu = elements.cpu()
+                test_cpu = test_elements.cpu() if isinstance(test_elements, torch.Tensor) else test_elements
+                result_cpu = torch.isin(elements_cpu, test_cpu)
+                return result_cpu.to(elements.device)
+    except Exception:
+        pass
+    return _original_isin(elements, test_elements)
+
+transformers.pytorch_utils.isin_mps_friendly = _safe_isin
+
+# 强制重新加载 logits_process 模块，使其获取新的 isin 引用
+import transformers.generation.logits_process
+importlib.reload(transformers.generation.logits_process)
+
+
 # Handle qwen_tts import
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
@@ -114,6 +142,18 @@ class Qwen3TTS_Train_Node:
 
         if not os.path.isdir(audio_folder):
             raise ValueError(f"Audio folder not found: {audio_folder}")
+			
+            # ----- 新增：自动检测设备（XPU > CUDA > CPU）-----
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            train_device = "xpu"
+            device_map_arg = {"": "xpu:0"}
+        elif torch.cuda.is_available():
+            train_device = "cuda"
+            device_map_arg = "cuda"
+        else:
+            train_device = "cpu"
+            device_map_arg = "cpu"
+            # -------------------------------------------------
 
         # Basic setup
         os.makedirs(output_dir, exist_ok=True)
@@ -156,7 +196,7 @@ class Qwen3TTS_Train_Node:
         # Load Main Model
         tts_model = Qwen3TTSModel.from_pretrained(
             model_path,
-            device_map="cuda",
+            device_map=device_map_arg, 
             dtype=torch.bfloat16,
             attn_implementation="sdpa" # Use sdpa for broad compatibility
         )
@@ -173,8 +213,8 @@ class Qwen3TTS_Train_Node:
              
         tts_tokenizer = Qwen3TTSTokenizer.from_pretrained(tokenizer_path)
         if hasattr(tts_tokenizer, 'model'):
-             tts_tokenizer.model.to("cuda")
-             tts_tokenizer.device = torch.device("cuda")
+             tts_tokenizer.model.to(train_device)                     # 改为 train_device
+             tts_tokenizer.device = torch.device(train_device)
 
         # 2. Prepare Dataset
         entries = self._prepare_dataset(audio_folder, tts_tokenizer, language, unique_id)
@@ -357,7 +397,7 @@ class Qwen3TTS_Train_Node:
             val_model = Qwen3TTSModel.from_pretrained(
                 checkpoint_path, 
                 dtype=torch.bfloat16, 
-                device_map="cuda", 
+                device_map=device_map_arg,  
                 attn_implementation="sdpa"
             )
             wavs, sr = val_model.generate_custom_voice(
@@ -375,6 +415,9 @@ class Qwen3TTS_Train_Node:
                     "audio_base64": b64
                 })
             del val_model
-            torch.cuda.empty_cache()
+            if hasattr(torch, 'xpu') and torch.xpu.is_available():
+                torch.xpu.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
         except Exception as e:
             logger.error(f"Validation failed: {e}")

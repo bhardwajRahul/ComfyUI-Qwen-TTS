@@ -19,6 +19,32 @@ try:
 except Exception:
     pass
 
+# ===== XPU 稳定性补丁：修复 level_zero 设备丢失 =====
+import transformers.pytorch_utils
+import importlib
+import torch
+
+# 替换原始函数为 XPU 安全版本
+_original_isin = transformers.pytorch_utils.isin_mps_friendly
+
+def _safe_isin(elements, test_elements):
+    """将 isin 操作移到 CPU 执行，防止 Intel XPU level_zero 崩溃"""
+    try:
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            if isinstance(elements, torch.Tensor) and elements.device.type == 'xpu':
+                elements_cpu = elements.cpu()
+                test_cpu = test_elements.cpu() if isinstance(test_elements, torch.Tensor) else test_elements
+                result_cpu = torch.isin(elements_cpu, test_cpu)
+                return result_cpu.to(elements.device)
+    except Exception:
+        pass
+    return _original_isin(elements, test_elements)
+
+transformers.pytorch_utils.isin_mps_friendly = _safe_isin
+
+# 强制重新加载 logits_process 模块，使其获取新的 isin 引用
+import transformers.generation.logits_process
+importlib.reload(transformers.generation.logits_process)
 
 
 # Common languages list for UI
@@ -242,7 +268,9 @@ def unload_cached_model(cache_key=None):
     gc.collect()
     gc.collect()
 
-    if torch.cuda.is_available():
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        torch.xpu.synchronize()
+    elif torch.cuda.is_available():
         torch.cuda.synchronize()
 
     print(f"[Qwen3-TTS] Model cache and GPU memory cleared")
@@ -358,10 +386,12 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     
     # Determine device
     if device == "auto":
-        if torch.cuda.is_available():
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            device = "xpu"
+        elif torch.cuda.is_available():
             device = "cuda"
         elif torch.backends.mps.is_available():
-            device = "mps"  # 针对 Mac 的关键修复
+            device = "mps"
         else:
             device = "cpu"
     
@@ -371,6 +401,16 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         dtype = torch.float16
     else:
         dtype = torch.bfloat16 if precision == "bf16" else torch.float32
+	
+	# ★★★ 关键：在这里定义 device_map_arg ★★★
+    if device == "cuda":
+        device_map_arg = "cuda"
+    elif device == "xpu":
+        device_map_arg = {"": "xpu:0"}
+    elif device == "mps":
+        device_map_arg = "mps"
+    else:
+        device_map_arg = "cpu"
     
     # VoiceDesign restriction
     if model_type == "VoiceDesign" and model_choice == "0.6B":
@@ -493,7 +533,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             from sageattention import sageattn
             print(f"🔧 [Qwen3-TTS] Loading model with sage_attn (sageattention)")
             
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype)
             
             # Patch attention modules to use sageattention
             patched_count = 0
@@ -526,18 +566,18 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             
         except (ImportError, Exception) as e:
             print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype)
     else:
         try:
             if attn_param:
                 print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param)
+                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype, attn_implementation=attn_param)
             else:
                 print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype)
         except (ImportError, ValueError, Exception) as e:
             print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype)
     
     # Apply patches
     apply_qwen3_patches(model)
@@ -565,7 +605,7 @@ class VoiceDesignNode:
                 "text": ("STRING", {"multiline": True, "default": "Hello world", "placeholder": "Enter text to synthesize"}),
                 "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Style instruction (required for VoiceDesign)"}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
-                "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
@@ -605,6 +645,8 @@ class VoiceDesignNode:
         model = load_qwen_model("VoiceDesign", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
 
         torch.manual_seed(seed)
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         np.random.seed(seed % (2**32))
@@ -654,7 +696,7 @@ class VoiceCloneNode:
             "required": {
                 "target_text": ("STRING", {"multiline": True, "default": "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
-                "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
@@ -787,10 +829,11 @@ class VoiceCloneNode:
         model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate, previous_attention, custom_model_path)
 
         torch.manual_seed(seed)
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         np.random.seed(seed % (2**32))
-        pbar.update_absolute(2, 3, None)
 
         audio_tuple = None
         if ref_audio is not None:
@@ -859,7 +902,7 @@ class CustomVoiceNode:
                 "text": ("STRING", {"multiline": True, "default": "Hello world", "placeholder": "Enter text to synthesize"}),
                 "speaker": (["Aiden", "Dylan", "Eric", "Ono_anna", "Ryan", "Serena", "Sohee", "Uncle_fu", "Vivian"], {"default": "Ryan"}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
-                "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
@@ -909,6 +952,8 @@ class CustomVoiceNode:
         model = load_qwen_model("CustomVoice", model_choice, device, precision, attention, unload_model_after_generate, previous_attention, custom_model_path)
 
         torch.manual_seed(seed)
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         np.random.seed(seed % (2**32))
@@ -960,7 +1005,7 @@ class VoiceClonePromptNode:
                 "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
                 "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (highly recommended for better quality)"}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
-                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
             },
@@ -1057,7 +1102,7 @@ class DialogueInferenceNode:
                 "script": ("STRING", {"multiline": True, "default": "Role1: Hello, how are you?\nRole2: I am fine, thank you.", "placeholder": "Format: RoleName: Text"}),
                 "role_bank": ("QWEN3_ROLE_BANK",),
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
-                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
                 # RENAMED: pause_seconds -> pause_linebreak
@@ -1109,6 +1154,8 @@ class DialogueInferenceNode:
         model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
 
         torch.manual_seed(seed)
+        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
         np.random.seed(seed % (2**32))
@@ -1232,7 +1279,9 @@ class DialogueInferenceNode:
                         silence = torch.zeros((1, 1, silence_len))
                         results.append(silence)
 
-                if torch.cuda.is_available():
+                if hasattr(torch, 'xpu') and torch.xpu.is_available():
+                    torch.xpu.empty_cache()
+                elif torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
                 pbar.update_absolute(current_chunk + 1, total_stages, None)
