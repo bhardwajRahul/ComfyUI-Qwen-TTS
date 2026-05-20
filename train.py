@@ -21,27 +21,27 @@ import transformers.pytorch_utils
 import importlib
 import torch
 
-# 替换原始函数为 XPU 安全版本
-_original_isin = transformers.pytorch_utils.isin_mps_friendly
+# XPU stability patch: redirect isin_mps_friendly to CPU to prevent Intel XPU level_zero crashes.
+# isin_mps_friendly was removed in newer transformers versions, so guard the patch.
+if hasattr(transformers.pytorch_utils, 'isin_mps_friendly'):
+    _original_isin = transformers.pytorch_utils.isin_mps_friendly
 
-def _safe_isin(elements, test_elements):
-    """将 isin 操作移到 CPU 执行，防止 Intel XPU level_zero 崩溃"""
-    try:
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            if isinstance(elements, torch.Tensor) and elements.device.type == 'xpu':
-                elements_cpu = elements.cpu()
-                test_cpu = test_elements.cpu() if isinstance(test_elements, torch.Tensor) else test_elements
-                result_cpu = torch.isin(elements_cpu, test_cpu)
-                return result_cpu.to(elements.device)
-    except Exception:
-        pass
-    return _original_isin(elements, test_elements)
+    def _safe_isin(elements, test_elements):
+        try:
+            if hasattr(torch, 'xpu') and torch.xpu.is_available():
+                if isinstance(elements, torch.Tensor) and elements.device.type == 'xpu':
+                    elements_cpu = elements.cpu()
+                    test_cpu = test_elements.cpu() if isinstance(test_elements, torch.Tensor) else test_elements
+                    result_cpu = torch.isin(elements_cpu, test_cpu)
+                    return result_cpu.to(elements.device)
+        except Exception:
+            pass
+        return _original_isin(elements, test_elements)
 
-transformers.pytorch_utils.isin_mps_friendly = _safe_isin
+    transformers.pytorch_utils.isin_mps_friendly = _safe_isin
 
-# 强制重新加载 logits_process 模块，使其获取新的 isin 引用
-import transformers.generation.logits_process
-importlib.reload(transformers.generation.logits_process)
+    import transformers.generation.logits_process
+    importlib.reload(transformers.generation.logits_process)
 
 
 # Handle qwen_tts import
