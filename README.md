@@ -121,8 +121,8 @@ All nodes support multiple attention implementations with automatic detection an
 
 | Mechanism | Description | Speed | Installation |
 |-----------|-------------|-------|--------------|
-| **sage_attn** | SAGE attention implementation | ⚡⚡⚡ Fastest | `pip install sage_attn` |
-| **flash_attn** | Flash Attention 2 | ⚡⚡ Fast | `pip install flash_attn` |
+| **sage_attn** | SAGE attention implementation | ⚡⚡⚡ Fastest | `pip install sageattention` |
+| **flash_attn** | Flash Attention 2 | ⚡⚡ Fast | `pip install flash_attention` |
 | **sdpa** | Scaled Dot Product Attention (PyTorch built-in) | ⚡ Medium | Built-in (no installation) |
 | **eager** | Standard attention (fallback) | 🐢 Slowest | Built-in (no installation) |
 | **auto** | Automatically selects best available option | Varies | N/A |
