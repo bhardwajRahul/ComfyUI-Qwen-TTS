@@ -145,6 +145,21 @@
 - 降级到 `eager`（作为最后手段）
 - 记录降级决策并显示警告信息
 
+### 旧款 NVIDIA 显卡 / CUDA 内核缺失
+
+对于 GTX 1080 Ti（计算能力 6.1）等 Ampere 之前的显卡，加载器使用 `eager`
+注意力，并将 `bf16` 调整为 `fp32`；`device=auto` 时同样生效。
+这一保守兼容模式也会覆盖手动选择的加速注意力。FP32 占用更多显存，可考虑 0.6B 模型。
+
+CUDA 下载或加载权重前会先执行一个小型运算。若出现
+`no kernel image is available for execution on the device` 或 `invalid device function`，
+说明 CUDA 内核无法在该显卡执行。错误现在会包含显卡、PyTorch/CUDA 版本和构建架构，
+并直接停止，不再以注意力回退为由重复尝试相同 CUDA 配置。
+请在 **ComfyUI 使用的 Python 环境**中安装支持该显卡且相互匹配的 PyTorch/torchaudio
+构建及 CUDA 扩展，然后重启 ComfyUI。切换注意力无法补齐 PyTorch 缺失的内核。
+也可以选择 `device=cpu`、`precision=fp32`、`attention=eager`（速度较慢，需要系统内存）。
+小型运算检查通过不代表模型使用的所有内核均已兼容。
+
 ### 模型缓存
 
 - 模型缓存包含注意力特定密钥
