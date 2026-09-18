@@ -145,6 +145,24 @@ If you select an attention mechanism that's not available:
 - Falls back to `eager` (as last resort)
 - Logs the fallback decision with a warning message
 
+### Older NVIDIA GPUs / missing CUDA kernels
+
+For pre-Ampere GPUs such as the GTX 1080 Ti (compute capability 6.1), the loader
+uses `eager` attention and changes `bf16` to `fp32`, including when `device` is
+`auto`. This conservative compatibility mode also overrides explicitly selected
+accelerated attention. FP32 uses more VRAM; the 0.6B model may be preferable.
+
+Before downloading or loading weights on CUDA, a small kernel checks the runtime.
+`no kernel image is available for execution on the device` or `invalid device
+function` indicates that a CUDA kernel cannot run on the GPU. The error now
+includes the GPU, PyTorch/CUDA versions and compiled architectures, and stops
+instead of retrying the same CUDA configuration as an attention fallback.
+Install a matching PyTorch/torchaudio build (and compatible CUDA extensions) that
+supports your GPU **in ComfyUI's Python environment**, then restart ComfyUI.
+Changing attention cannot add missing kernels to a PyTorch build. Alternatively,
+select `device=cpu`, `precision=fp32`, `attention=eager` (slower, requires system RAM).
+A successful small-kernel check does not guarantee support for every model kernel.
+
 ### Model Caching
 
 - Models are cached with attention-specific keys

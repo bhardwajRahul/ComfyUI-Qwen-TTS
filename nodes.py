@@ -160,8 +160,13 @@ def check_attention_implementation():
 
     return available
 
-def get_attention_implementation(selection: str) -> str:
+def get_attention_implementation(selection: str, device: str = None) -> str:
     """Get the actual attention implementation based on selection and availability."""
+    # Package availability does not imply that its CUDA kernels support this GPU.
+    if device == "cuda" and torch.cuda.get_device_capability()[0] < 8:
+        if selection != "eager":
+            print("[Qwen3-TTS] Using eager attention for pre-Ampere CUDA hardware.")
+        return "eager"
     available = check_attention_implementation()
 
     if selection == "auto":
@@ -180,6 +185,42 @@ def get_attention_implementation(selection: str) -> str:
             if "sdpa" in available:
                 return "sdpa"
             return "eager"
+
+
+def raise_cuda_kernel_error(error, device):
+    """Do not disguise missing CUDA kernels as an attention selection failure."""
+    message = str(error).lower()
+    if device != "cuda" or not any(marker in message for marker in (
+        "no kernel image is available", "invalid device function",
+    )):
+        return
+    major, minor = torch.cuda.get_device_capability()
+    raise RuntimeError(
+        f"[Qwen3-TTS] CUDA kernels cannot run on {torch.cuda.get_device_name()} "
+        f"(compute capability {major}.{minor}, sm_{major}{minor}). "
+        f"PyTorch {torch.__version__}, CUDA {torch.version.cuda}, "
+        f"compiled architectures: {torch.cuda.get_arch_list()}. "
+        "Use a PyTorch/torchaudio build and CUDA extensions compatible with this GPU "
+        "in the ComfyUI Python environment, then restart ComfyUI; "
+        "or select device='cpu', precision='fp32', attention='eager'. "
+        "Changing attention alone cannot repair missing PyTorch CUDA kernels. "
+        f"Original error: {error}"
+    ) from error
+
+
+def check_cuda_runtime(device):
+    """Run a small kernel before downloading/loading weights, not just allocation.
+
+    Test execution instead of rejecting GPUs absent from get_arch_list(): a build
+    may still work through binary compatibility or PTX JIT compilation.
+    """
+    if device == "cuda":
+        try:
+            torch.zeros(1, device=device, dtype=torch.float32).add_(1)
+            torch.cuda.synchronize()
+        except RuntimeError as error:
+            raise_cuda_kernel_error(error, device)
+            raise
 
 
 def split_text_by_pauses(text: str, config: Dict[str, float]) -> List[Tuple[str, float]]:
@@ -381,11 +422,6 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         print(f"🔄 [Qwen3-TTS] Attention changed from '{previous_attention}' to '{attention}', clearing cache...")
         unload_cached_model()
     
-    attn_impl = get_attention_implementation(attention)
-    
-    # Check and download tokenizer (shared by all models)
-    check_and_download_tokenizer()
-    
     # Determine device
     if device == "auto":
         if hasattr(torch, 'xpu') and torch.xpu.is_available():
@@ -396,6 +432,11 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             device = "mps"
         else:
             device = "cpu"
+
+    if device == "cuda" and precision == "bf16" and torch.cuda.get_device_capability()[0] < 8:
+        print("[Qwen3-TTS] Native BF16 is unavailable on this GPU; using fp32 (more VRAM required).")
+        precision = "fp32"
+    attn_impl = get_attention_implementation(attention, device)
     
     if device == "mps" and precision == "bf16":
         dtype = torch.bfloat16
@@ -422,6 +463,10 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     cache_key = (model_type, model_choice, device, precision, attn_impl, custom_model_path)
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
+
+    check_cuda_runtime(device)
+    # Check and download tokenizer only after validating the CUDA runtime.
+    check_and_download_tokenizer()
 
     # Clear old cache only when adding a new model with different config
     if _MODEL_CACHE:
@@ -567,8 +612,9 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             print(f"🔧 [Qwen3-TTS] Patched {patched_count} attention modules with sage_attn")
             
         except (ImportError, Exception) as e:
-            print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype)
+            raise_cuda_kernel_error(e, device)
+            print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to eager attention: {e}")
+            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype, attn_implementation="eager")
     else:
         try:
             if attn_param:
@@ -578,8 +624,11 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
                 model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype)
         except (ImportError, ValueError, Exception) as e:
-            print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype)
+            raise_cuda_kernel_error(e, device)
+            if attn_impl == "eager":
+                raise
+            print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to eager attention: {e}")
+            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device_map_arg, dtype=dtype, attn_implementation="eager")
     
     # Apply patches
     apply_qwen3_patches(model)
