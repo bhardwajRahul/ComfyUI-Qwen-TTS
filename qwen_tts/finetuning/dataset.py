@@ -30,6 +30,10 @@ AudioLike = Union[
 
 MaybeList = Union[Any, List[Any]]
 
+# The codec/mel front-end is fixed at 24kHz. Any other input sample rate is
+# resampled here so callers can feed arbitrary audio without pre-converting.
+TARGET_SAMPLE_RATE = 24000
+
 class TTSDataset(Dataset):
     def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
         self.data_list = data_list
@@ -47,7 +51,21 @@ class TTSDataset(Dataset):
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
 
-        return audio.astype(np.float32), int(sr)
+        return self._resample_to_target(audio, sr)
+
+    def _resample_to_target(self, audio: np.ndarray, sr: int) -> Tuple[np.ndarray, int]:
+        """Resample audio to TARGET_SAMPLE_RATE, keeping 24kHz input untouched."""
+        sr = int(sr)
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+        if sr == TARGET_SAMPLE_RATE:
+            return audio, sr
+        try:
+            audio = librosa.resample(
+                y=audio, orig_sr=sr, target_sr=TARGET_SAMPLE_RATE, res_type="soxr_hq"
+            )
+        except Exception:
+            audio = librosa.resample(y=audio, orig_sr=sr, target_sr=TARGET_SAMPLE_RATE)
+        return np.ascontiguousarray(audio, dtype=np.float32), TARGET_SAMPLE_RATE
 
     def _normalize_audio_inputs(self, audios: Union[AudioLike, List[AudioLike]]) -> List[Tuple[np.ndarray, int]]:
         """
@@ -80,7 +98,7 @@ class TTSDataset(Dataset):
             if isinstance(a, str):
                 out.append(self._load_audio_to_np(a))
             elif isinstance(a, tuple) and len(a) == 2 and isinstance(a[0], np.ndarray):
-                out.append((a[0].astype(np.float32), int(a[1])))
+                out.append(self._resample_to_target(a[0], a[1]))
             elif isinstance(a, np.ndarray):
                 raise ValueError("For numpy waveform input, pass a tuple (audio, sr).")
             else:
@@ -102,7 +120,7 @@ class TTSDataset(Dataset):
     
     @torch.inference_mode()
     def extract_mels(self, audio, sr):
-        assert sr == 24000, "Only support 24kHz audio"
+        assert sr == TARGET_SAMPLE_RATE, "Only support 24kHz audio"
         mels = mel_spectrogram(
             torch.from_numpy(audio).unsqueeze(0), 
             n_fft=1024, 

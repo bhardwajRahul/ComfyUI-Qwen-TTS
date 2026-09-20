@@ -36,7 +36,12 @@ from transformers.masking_utils import (
 # transformers 5 renamed create_causal_mask argument `input_embeds` to
 # `inputs_embeds` and dropped `cache_position`; the vendored calls use the v4
 # names. Rebind thin adapters. No-op on transformers <5.
-if not getattr(create_causal_mask, "_v5_shim", False):
+# Probe the signature instead of a "already shimmed?" flag: on transformers <5
+# the original function does not carry that flag either, so the old guard made
+# this shim install itself on 4.x and rewrite `input_embeds` into a keyword 4.x
+# rejects (TypeError: unexpected keyword argument 'inputs_embeds').
+import inspect as _inspect
+if "inputs_embeds" in _inspect.signature(create_causal_mask).parameters:
     _create_causal_mask_v4 = create_causal_mask
     _create_sliding_v4 = create_sliding_window_causal_mask
 
