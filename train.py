@@ -5,6 +5,7 @@ import json
 import base64
 import shutil
 import logging
+import gc
 import torch
 import numpy as np
 import sys
@@ -65,8 +66,9 @@ logger = logging.getLogger("ComfyUI-Qwen-TTS-Train")
 SUPPORTED_AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
 
 def send_training_update(node_id, data):
-    if PromptServer.instance is not None:
-        PromptServer.instance.send_sync(
+    server = getattr(PromptServer, "instance", None)
+    if server is not None:
+        server.send_sync(
             "qwen3tts_training_update",
             {"node": str(node_id), **data}
         )
@@ -121,6 +123,29 @@ class Qwen3TTS_Train_Node:
                 "batch_size": ("INT", {"default": 1, "min": 1, "max": 8}),
                 "gradient_accumulation_steps": ("INT", {"default": 4, "min": 1, "max": 64}),
                 "validate_every": ("INT", {"default": 2, "min": 1, "max": 10}),
+                "device": (["auto", "cuda", "xpu", "mps", "cpu"], {
+                    "default": "auto",
+                    "tooltip": "Which device trains. auto = xpu > cuda > mps > cpu. "
+                               "A device this build does not have stops with a clear error instead "
+                               "of switching silently.",
+                }),
+                "optimizer_state": (["bf16", "8bit"], {
+                    "default": "bf16",
+                    "tooltip": "Precision of the Adam moments: bf16 ~7.2 GiB for a 1.9B model, "
+                               "8bit ~3.8 GiB. On XPU the 8-bit path needs bitsandbytes; without it "
+                               "the node falls back to bf16 and says so.",
+                }),
+                "optimizer_placement": (["vram", "ram"], {
+                    "default": "vram",
+                    "tooltip": "Where the Adam moments live. vram is the original behaviour; on a "
+                               "16 GiB card a 1.9B full fine-tune runs out of memory there, so pick "
+                               "ram (states in system RAM, updates on the CPU) or 8bit.",
+                }),
+                "gradient_checkpointing": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Recompute each layer in the backward pass: measured ~5.7 GiB less "
+                               "peak VRAM on the 1.9B model, at the cost of extra compute.",
+                }),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -134,7 +159,55 @@ class Qwen3TTS_Train_Node:
     OUTPUT_NODE = True
 
     @torch.inference_mode(False)
-    def train(self, init_model, tokenizer, audio_folder, output_dir, speaker_name, test_text, language, learning_rate, num_epochs, batch_size, gradient_accumulation_steps, validate_every, unique_id=None):
+    def train(self, init_model, tokenizer, audio_folder, output_dir, speaker_name, test_text, language, learning_rate, num_epochs, batch_size, gradient_accumulation_steps, validate_every, device="auto", optimizer_state="bf16", optimizer_placement="vram", gradient_checkpointing=False, unique_id=None):
+        holder = {}
+        try:
+            return self._train_impl(
+                init_model, tokenizer, audio_folder, output_dir, speaker_name, test_text,
+                language, learning_rate, num_epochs, batch_size, gradient_accumulation_steps,
+                validate_every, device, optimizer_state, optimizer_placement,
+                gradient_checkpointing, unique_id, holder,
+            )
+        finally:
+            # Leaving this to the garbage collector kept the previous run alive: a second
+            # training in the same ComfyUI process started +3.7 GB of VRAM and +17.5 GB of
+            # RAM higher (measured with two back-to-back runs), which is how a card runs
+            # out of memory after a few rounds. The optimizer registers a backward hook on
+            # every parameter, and that hook is stored on the C++ side of the autograd
+            # metadata - invisible to Python's collector - so the optimizer, its host
+            # buffers and the whole model stay reachable long after the run returns.
+            # Tear those tensors down explicitly instead of waiting for a collection that
+            # never happens.
+            self._free_run_memory(holder)
+            gc.collect()
+            self._empty_cache()
+
+    @staticmethod
+    def _free_run_memory(holder):
+        """Drop the weights, optimizer states and pinned host copies of a finished run."""
+        optimizer = holder.get("optimizer")
+        model = holder.get("model")
+        if optimizer is not None:
+            host = getattr(optimizer, "param_d2h_map", None)
+            if host:
+                for p in list(host.values()):
+                    p.grad = None
+                    p.data = torch.empty(0)
+                host.clear()
+            for inner in list(getattr(optimizer, "optim_dict", {}).values()):
+                inner.state.clear()
+            d_opt = getattr(optimizer, "d_opt", None)
+            if d_opt is not None:
+                d_opt.state.clear()
+            if hasattr(optimizer, "queue"):
+                optimizer.queue.clear()
+        if model is not None:
+            for p in model.parameters():
+                p.grad = None
+                p.data = torch.empty(0)
+        holder.clear()
+
+    def _train_impl(self, init_model, tokenizer, audio_folder, output_dir, speaker_name, test_text, language, learning_rate, num_epochs, batch_size, gradient_accumulation_steps, validate_every, device="auto", optimizer_state="bf16", optimizer_placement="vram", gradient_checkpointing=False, unique_id=None, holder=None):
         torch.set_grad_enabled(True)
         
         if TTSDataset is None:
@@ -143,17 +216,9 @@ class Qwen3TTS_Train_Node:
         if not os.path.isdir(audio_folder):
             raise ValueError(f"Audio folder not found: {audio_folder}")
 			
-            # ----- 新增：自动检测设备（XPU > CUDA > CPU）-----
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            train_device = "xpu"
-            device_map_arg = {"": "xpu:0"}
-        elif torch.cuda.is_available():
-            train_device = "cuda"
-            device_map_arg = "cuda"
-        else:
-            train_device = "cpu"
-            device_map_arg = "cpu"
-            # -------------------------------------------------
+        # ----- 设备：节点可选（auto = xpu > cuda > mps > cpu），XPU 走专属分支 -----
+        train_device = self._resolve_device(device)
+        device_map_arg = {"": f"{train_device}:0"} if train_device in ("xpu", "cuda") else train_device
 
         # Basic setup
         os.makedirs(output_dir, exist_ok=True)
@@ -229,8 +294,24 @@ class Qwen3TTS_Train_Node:
         for param in tts_model.model.parameters():
             param.requires_grad = True
             
-        optimizer = AdamW(tts_model.model.parameters(), lr=learning_rate)
         model = tts_model.model # Access internal HuggingFace model
+        if holder is not None:
+            holder["model"] = model
+        optimizer = self._build_optimizer(
+            optimizer_state,
+            optimizer_placement,
+            model.parameters(),
+            learning_rate,
+            train_device,
+            gradient_accumulation_steps,
+            unique_id,
+        )
+        if holder is not None:
+            holder["optimizer"] = optimizer
+        if gradient_checkpointing:
+            status = self._enable_gradient_checkpointing(model)
+            logger.info(f"[Qwen3TTS][train] gradient checkpointing: {status}")
+            send_training_update(unique_id, {"type": "status", "message": f"Gradient checkpointing: {status}"})
         device = next(model.parameters()).device
         
         target_speaker_embedding = None
@@ -241,6 +322,8 @@ class Qwen3TTS_Train_Node:
         
         final_checkpoint = None
         optimizer.zero_grad() # Initialize gradients
+        pending_grads = 0
+        skipped_steps = 0
         
         for epoch in range(num_epochs):
             if model_management.processing_interrupted():
@@ -299,16 +382,35 @@ class Qwen3TTS_Train_Node:
                 
                 loss = outputs.loss + sub_talker_loss
                 
-                optimizer.zero_grad()
-                loss.backward()
-                
-                # Gradient Accumulation Step
-                if (step + 1) % gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                
                 epoch_loss += loss.item()
+                
+                if not torch.isfinite(loss):
+                    skipped_steps += 1
+                    logger.warning(
+                        "[Qwen3TTS][train] epoch %d micro-batch %d produced a non-finite loss "
+                        "(%s); dropping this batch", epoch + 1, step, loss.item(),
+                    )
+                    send_training_update(unique_id, {
+                        "type": "status",
+                        "message": f"Skipped a non-finite batch (loss={loss.item()}); training continues",
+                    })
+                    self._reset_gradients(model, optimizer)
+                    pending_grads = 0
+                    pbar.update(1)
+                    continue
+                
+                # Gradient accumulation: the loop used to call zero_grad() right before
+                # every backward(), so only the last micro-batch of each cycle ever
+                # reached the optimizer and 3/4 of the data was silently dropped.
+                # Accumulate across the cycle now, step at its end, and scale the loss
+                # so one cycle still equals the mean of its micro-batches.
+                (loss / gradient_accumulation_steps).backward()
+                pending_grads += 1
+                
+                if pending_grads >= gradient_accumulation_steps:
+                    skipped_steps += self._apply_step(model, optimizer, unique_id, epoch, step)
+                    pending_grads = 0
+                
                 pbar.update(1)
                 
                 if step % 5 == 0:
@@ -317,6 +419,12 @@ class Qwen3TTS_Train_Node:
                         "epoch": epoch+1, 
                         "loss": loss.item()
                     })
+
+            # Flush the tail of the epoch when the dataset size is not a multiple of
+            # the accumulation window, otherwise the last few samples never update.
+            if pending_grads > 0 and not model_management.processing_interrupted():
+                skipped_steps += self._apply_step(model, optimizer, unique_id, epoch, "tail")
+                pending_grads = 0
 
             # Checkpoint
             if (epoch + 1) % validate_every == 0 or epoch == num_epochs - 1:
@@ -349,10 +457,280 @@ class Qwen3TTS_Train_Node:
                 final_checkpoint = checkpoint_dir
                 
                 # Validation
-                self._run_validation(checkpoint_dir, test_text, speaker_name, unique_id, epoch+1)
+                self._run_validation(
+                    checkpoint_dir,
+                    test_text,
+                    speaker_name,
+                    unique_id,
+                    epoch + 1,
+                    train_device,
+                    model,
+                )
 
-        send_training_update(unique_id, {"type": "status", "message": "Done!"})
+        done_msg = "Done!" if not skipped_steps else f"Done! ({skipped_steps} non-finite update(s) skipped)"
+        send_training_update(unique_id, {"type": "status", "message": done_msg})
+        if skipped_steps:
+            logger.warning(
+                "[Qwen3TTS][train] finished with %d skipped update(s) caused by non-finite "
+                "values (kept the rest of the run usable)", skipped_steps,
+            )
         return (final_checkpoint,)
+
+    DEVICES = ("auto", "cuda", "xpu", "mps", "cpu")
+
+    @staticmethod
+    def _available(kind):
+        """Is this backend usable in the running PyTorch build?"""
+        try:
+            if kind == "xpu":
+                return bool(getattr(torch, "xpu", None)) and torch.xpu.is_available()
+            if kind == "cuda":
+                return torch.cuda.is_available()
+            if kind == "mps":
+                backend = getattr(torch.backends, "mps", None)
+                return bool(backend) and backend.is_available()
+            if kind == "cpu":
+                return True
+        except Exception:  # noqa: BLE001 - "unavailable" is the safe answer
+            return False
+        return False
+
+    @classmethod
+    def _resolve_device(cls, requested):
+        """Node's device choice; 'auto' keeps the historical priority XPU > CUDA > MPS > CPU.
+
+        An explicit choice that this machine cannot run is reported as such instead of
+        silently landing somewhere else, so the node never trains on a device the user
+        did not pick.
+        """
+        req = (requested or "auto").strip().lower()
+        if req == "auto":
+            for kind in ("xpu", "cuda", "mps"):
+                if cls._available(kind):
+                    return kind
+            return "cpu"
+        if req not in cls.DEVICES:
+            raise ValueError(
+                f"device='{requested}' is not one of {', '.join(cls.DEVICES)}"
+            )
+        if not cls._available(req):
+            raise RuntimeError(
+                f"device='{req}' was selected but is not available in this build "
+                f"(torch {torch.__version__}; xpu={cls._available('xpu')}, "
+                f"cuda={cls._available('cuda')}, mps={cls._available('mps')}). "
+                f"Pick 'auto' or a device this machine actually has."
+            )
+        return req
+
+    @staticmethod
+    def _empty_cache(*devices):
+        """Release the caching allocator on the given backends (ignores absent ones)."""
+        targets = set(devices) or set(Qwen3TTS_Train_Node.DEVICES)
+        for kind, flush in (
+            ("xpu", lambda: torch.xpu.empty_cache()),
+            ("cuda", lambda: torch.cuda.empty_cache()),
+            ("mps", lambda: torch.mps.empty_cache()),
+        ):
+            if kind in targets and Qwen3TTS_Train_Node._available(kind):
+                try:
+                    flush()
+                except Exception as e:  # noqa: BLE001 - cache flushing is best effort
+                    logger.debug(f"[Qwen3TTS][train] {kind} empty_cache failed: {e}")
+
+    def _build_optimizer(
+        self,
+        optimizer_state,
+        optimizer_placement,
+        params,
+        lr,
+        device="xpu",
+        grad_accum_steps=1,
+        unique_id=None,
+    ):
+        """Two independent choices, so every combination is valid.
+
+        optimizer_state — how the Adam moments (exp_avg / exp_avg_sq) are stored:
+            bf16  PyTorch default: the states follow the bf16 parameters (7.2 GiB for 1.9B)
+            8bit  torchao block-wise quantized states (~3.6 GiB)
+        optimizer_placement — where those states live (a device choice, not a switch):
+            vram  on the accelerator, next to the parameters (default)
+            ram   in system RAM; updates run on the CPU and are copied back
+                  (1.9B: frees ~7.2 GiB of VRAM, 96 GB of RAM is plenty)
+
+        Measured on the A770 (1.9B, L=1100): bf16+vram ~3.0 s/step, bf16+ram ~3.9 s/step,
+        8bit+vram ~4.7 s/step. 8bit+vram is the fast way to buy VRAM back; 8bit+ram also
+        runs the 8-bit states (on the host copies) and is simply the slowest option.
+
+        Platform note: the kwargs below are only tightened for XPU. CUDA/ROCm/MPS keep
+        PyTorch's own defaults, so their fast paths (fused/foreach) are untouched.
+        """
+        params = list(params)
+        optimizer_class = AdamW
+        if optimizer_state == "8bit":
+            optimizer_class = self._eight_bit_optimizer(device, unique_id)
+            if optimizer_class is AdamW:
+                optimizer_state = "bf16"
+
+        if optimizer_placement == "ram":
+            if device == "cpu":
+                # Nothing to offload: the parameters already live in system RAM, and
+                # torchao's CPUOffloadOptimizer needs a CUDA/XPU device for the copies.
+                logger.info(
+                    "[Qwen3TTS][train] optimizer: %s states on cpu "
+                    "(placement=ram is a no-op without an accelerator)",
+                    optimizer_state,
+                )
+                return optimizer_class(params, lr=lr)
+            from torchao.optim import CPUOffloadOptimizer
+
+            # torchao frees each device gradient right after copying it to the host, and
+            # the copy is an assignment, not an addition. With gradient accumulation the
+            # device gradient therefore has to stay alive, otherwise every cycle keeps
+            # only its last micro-batch.
+            kwargs = {"offload_gradients": grad_accum_steps <= 1}
+            if optimizer_class is AdamW and device == "xpu":
+                # torchao defaults to fused=True, and the fused Adam kernel asks the
+                # XPU device for fp64 (bias-correction scalars). DG2 has no fp64, so
+                # the fused path raises "Required aspect fp64 is not supported".
+                kwargs.update(fused=False, foreach=False)
+            logger.info(
+                "[Qwen3TTS][train] optimizer: %s states in RAM on %s "
+                "(grad_accum=%d, device gradients %s)",
+                optimizer_state,
+                device,
+                grad_accum_steps,
+                "freed after each micro-batch" if kwargs["offload_gradients"] else "kept for accumulation",
+            )
+            return CPUOffloadOptimizer(
+                params,
+                optimizer_class=optimizer_class,
+                lr=lr,
+                # Offload every parameter (minimal_size is "keep anything smaller than
+                # this on the GPU"): with the default cut-off a few hundred small
+                # tensors stay on the device, so their gradients live somewhere the
+                # host-side clipping below cannot see.
+                minimal_size=1,
+                **kwargs,
+            )
+        logger.info(
+            "[Qwen3TTS][train] optimizer: %s states on the %s (PyTorch defaults)",
+            optimizer_state,
+            device,
+        )
+        return optimizer_class(params, lr=lr)
+
+    @staticmethod
+    def _eight_bit_optimizer(device, unique_id=None):
+        """8-bit Adam states, picked per backend.
+
+        bitsandbytes is used on XPU only. torchao's AdamW8bit is the reference
+        implementation there (and is what CUDA/ROCm/MPS keep using), but on XPU it
+        silently destroys the weights: one real step on the 1.7B model with the
+        segmented dataset turned 315/480 tensors into NaN while the losses and the
+        gradients were still finite (measured 2026-09-20, torch 2.14.0+xpu). The
+        bitsandbytes kernel keeps the same step at 0/480.
+
+        Every other device keeps torchao, falls back to bitsandbytes if torchao is
+        missing, and only reports + trains with bf16 states when neither is installed.
+        """
+        if device != "xpu":
+            try:
+                from torchao.optim import AdamW8bit
+
+                return AdamW8bit
+            except Exception as e:  # noqa: BLE001
+                logger.info("[Qwen3TTS][train] torchao 8-bit optimizer unavailable (%s)", e)
+                try:
+                    from bitsandbytes.optim import AdamW8bit as BnbAdamW8bit
+
+                    return BnbAdamW8bit
+                except Exception as e2:  # noqa: BLE001
+                    msg = (f"no 8-bit optimizer backend is installed for {device} "
+                           f"(torchao: {e}; bitsandbytes: {e2}); using bf16 states.")
+                    logger.warning("[Qwen3TTS][train] %s", msg)
+                    send_training_update(unique_id, {"type": "status", "message": msg})
+                    return AdamW
+        try:
+            from bitsandbytes.optim import AdamW8bit as BnbAdamW8bit
+
+            logger.info("[Qwen3TTS][train] 8-bit states via bitsandbytes on XPU")
+            return BnbAdamW8bit
+        except Exception as e:  # noqa: BLE001 - report and keep training
+            msg = (f"8-bit optimizer states need bitsandbytes on XPU (torchao's 8-bit "
+                   f"path turns this model into NaN); not usable here ({e}), "
+                   f"falling back to bf16 states.")
+            logger.warning("[Qwen3TTS][train] %s", msg)
+            send_training_update(unique_id, {"type": "status", "message": msg})
+            return AdamW
+
+    @staticmethod
+    def _clip_gradients(model, optimizer, max_norm=1.0):
+        """Clip on the side the optimizer actually reads gradients from.
+
+        With CPU offload the backward hook copies each gradient to pinned host memory
+        and clears the device copy, so clip_grad_norm_(model.parameters(), ...) only
+        sees the handful of parameters that stayed on the GPU: measured norm 7.5
+        instead of the real 484. The unclipped host gradients then blow the weights up
+        (first training run produced 135/404 NaN tensors and generation crashed inside
+        the Level Zero driver).
+        """
+        host_map = getattr(optimizer, "param_d2h_map", None)
+        if host_map:
+            params = [p for p in host_map.values() if getattr(p, "grad", None) is not None]
+            if params:
+                return torch.nn.utils.clip_grad_norm_(params, max_norm)
+        return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+    @classmethod
+    def _apply_step(cls, model, optimizer, unique_id, epoch, step):
+        """Clip and step, but never let a non-finite gradient reach the weights.
+
+        The XPU backward intermittently returns non-finite gradients for this model
+        (measured: 1 of 3 identical runs on the segmented dataset produced an all-NaN
+        gradient on the second update). Letting that through turned 400/404 tensors into
+        NaN and the next validation then killed the process inside the Level Zero
+        driver. Skipping one update keeps the run and the checkpoint usable.
+
+        Returns 1 when the update was skipped, 0 otherwise.
+        """
+        norm = cls._clip_gradients(model, optimizer, 1.0)
+        if not bool(torch.isfinite(norm)):
+            logger.warning(
+                "[Qwen3TTS][train] non-finite gradient norm (%s) at epoch %s step %s; "
+                "skipping this update", norm, epoch + 1, step,
+            )
+            send_training_update(unique_id, {
+                "type": "status",
+                "message": "Non-finite gradient detected - skipped one update to keep the weights sane",
+            })
+            cls._reset_gradients(model, optimizer)
+            return 1
+        optimizer.step()
+        optimizer.zero_grad()
+        return 0
+
+    @staticmethod
+    def _reset_gradients(model, optimizer):
+        """Drop accumulated gradients on both the device and the offloaded host copies."""
+        host_map = getattr(optimizer, "param_d2h_map", None)
+        if host_map:
+            for p in host_map.values():
+                if getattr(p, "grad", None) is not None:
+                    p.grad.zero_()
+        optimizer.zero_grad()
+
+    def _enable_gradient_checkpointing(self, model):
+        """Best effort: the talker transformer is an HF model, so reuse its own API."""
+        try:
+            target = getattr(getattr(model, "talker", None), "model", None)
+            if target is None or not hasattr(target, "gradient_checkpointing_enable"):
+                return "unsupported"
+            target.gradient_checkpointing_enable()
+            if hasattr(target, "config"):
+                target.config.use_cache = False
+            return "enabled"
+        except Exception as e:  # noqa: BLE001 - surface the reason instead of failing the run
+            return f"failed: {e}"
 
     def _prepare_dataset(self, audio_folder, tokenizer, language, unique_id):
         folder = Path(audio_folder)
@@ -392,8 +770,26 @@ class Qwen3TTS_Train_Node:
                 
         return entries
 
-    def _run_validation(self, checkpoint_path, text, speaker, unique_id, epoch):
+    def _run_validation(
+        self, checkpoint_path, text, speaker, unique_id, epoch, device="xpu", train_model=None
+    ):
+        """Generate a preview with the just-saved checkpoint.
+
+        Validation loads a *second* copy of the 1.7B model, so the training copy has to
+        leave the GPU first; otherwise both live on a 16 GB card at once and the driver
+        dies with an access violation (observed: 3 epochs trained fine, then the crash
+        hit inside generate_custom_voice).
+        """
+        parked = False
+        if train_model is not None and hasattr(train_model, "to"):
+            try:
+                train_model.to("cpu")
+                self._empty_cache(device)
+                parked = True
+            except Exception as e:  # noqa: BLE001 - validation is best effort
+                logger.warning(f"[Qwen3TTS][train] could not park the training model: {e}")
         try:
+            device_map_arg = {"": f"{device}:0"} if device in ("xpu", "cuda") else device
             val_model = Qwen3TTSModel.from_pretrained(
                 checkpoint_path, 
                 dtype=torch.bfloat16, 
@@ -415,9 +811,13 @@ class Qwen3TTS_Train_Node:
                     "audio_base64": b64
                 })
             del val_model
-            if hasattr(torch, 'xpu') and torch.xpu.is_available():
-                torch.xpu.empty_cache()
-            elif torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._empty_cache(device)
         except Exception as e:
             logger.error(f"Validation failed: {e}")
+        finally:
+            if parked:
+                try:
+                    train_model.to(device)
+                    self._empty_cache(device)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[Qwen3TTS][train] could not move the training model back: {e}")

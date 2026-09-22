@@ -32,11 +32,31 @@ from transformers.masking_utils import (
     create_sliding_window_causal_mask,
 )
 
+
+def _run_decoder_layer(layer, hidden_states, *, checkpointing: bool, **kwargs):
+    """Run one decoder layer, optionally under activation checkpointing.
+
+    ``gradient_checkpointing_enable()`` only sets ``self.gradient_checkpointing``;
+    the vendored layer loops never consumed that flag, so fine-tuning kept every
+    intermediate activation alive. With checkpointing on, each layer stores just
+    its inputs and recomputes the rest during the backward pass.
+    """
+    if checkpointing:
+        import torch.utils.checkpoint as _checkpoint
+
+        return _checkpoint.checkpoint(layer, hidden_states, use_reentrant=False, **kwargs)
+    return layer(hidden_states, **kwargs)
+
 # --- transformers >=5 compat (patched locally) -------------------------------
 # transformers 5 renamed create_causal_mask argument `input_embeds` to
 # `inputs_embeds` and dropped `cache_position`; the vendored calls use the v4
 # names. Rebind thin adapters. No-op on transformers <5.
-if not getattr(create_causal_mask, "_v5_shim", False):
+# Probe the signature instead of a "already shimmed?" flag: on transformers <5
+# the original function does not carry that flag either, so the old guard made
+# this shim install itself on 4.x and rewrite `input_embeds` into a keyword 4.x
+# rejects (TypeError: unexpected keyword argument 'inputs_embeds').
+import inspect as _inspect
+if "inputs_embeds" in _inspect.signature(create_causal_mask).parameters:
     _create_causal_mask_v4 = create_causal_mask
     _create_sliding_v4 = create_sliding_window_causal_mask
 
@@ -1139,8 +1159,12 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
+            layer_outputs = _run_decoder_layer(
+                decoder_layer,
                 hidden_states,
+                checkpointing=bool(
+                    self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+                ),
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -1558,8 +1582,12 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
+            layer_outputs = _run_decoder_layer(
+                decoder_layer,
                 hidden_states,
+                checkpointing=bool(
+                    self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+                ),
                 attention_mask=causal_mask,
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
